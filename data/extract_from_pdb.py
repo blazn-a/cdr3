@@ -2,185 +2,152 @@
 import os
 import re
 import pandas as pd
+import concurrent.futures
+from functools import partial
 
 # ---------------- CONFIG ----------------
 IMGTPDB_DIR = "data/imgt_pdbs"
 OUT_CSV = "cdr3_antigen_dataset.csv"
+CDR3_START = 105
+CDR3_END = 117
 
 # ---------------- AA MAP ----------------
 AA_MAP = {
-    'ALA':'A','ARG':'R','ASN':'N','ASP':'D','CYS':'C',
-    'GLN':'Q','GLU':'E','GLY':'G','HIS':'H','ILE':'I',
-    'LEU':'L','LYS':'K','MET':'M','PHE':'F','PRO':'P',
-    'SER':'S','THR':'T','TRP':'W','TYR':'Y','VAL':'V',
-    'SEC':'U','PYL':'O'
+    'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C',
+    'GLN': 'Q', 'GLU': 'E', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
+    'LEU': 'L', 'LYS': 'K', 'MET': 'M', 'PHE': 'F', 'PRO': 'P',
+    'SER': 'S', 'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V',
+    'SEC': 'U', 'PYL': 'O'
 }
 
-def three_to_one(res):
-    return AA_MAP.get(res.upper(), 'X')
+# Pre-compile Regex
+PAIRED_HL_PATTERN = re.compile(
+    r"PAIRED_HL\s+HCHAIN=([A-Za-z0-9])\s+LCHAIN=([A-Za-z0-9])\s+AGCHAIN=([\w,]+)"
+)
 
-# ---------------- PAIRED_HL PARSER ----------------
-def parse_paired_hl_lines(lines):
+def three_to_one(res):
+    return AA_MAP.get(res, 'X')
+
+# ---------------- CORE PROCESSOR ----------------
+def process_single_pdb(filepath):
     """
-    Parse REMARK 5 PAIRED_HL lines. Returns list of dicts:
-      {"H": "B", "L": "A", "AG": ["C","D"]}
+    Parses a single PDB file in one pass.
+    Returns a list of row dictionaries.
     """
+    pdb_id = os.path.splitext(os.path.basename(filepath))[0].upper()
+    
+    try:
+        with open(filepath, "r") as f:
+            # Read all lines once
+            lines = f.readlines()
+    except Exception as e:
+        return []
+
+    # Data containers
     pairs = []
-    pattern = re.compile(
-        r"PAIRED_HL\s+HCHAIN=([A-Za-z0-9])\s+LCHAIN=([A-Za-z0-9])\s+AGCHAIN=([\w,]+)"
-    )
+    seqres_data = {} # chain -> list of chars
+    
+    # ATOM data containers
+    # chain -> list of chars
+    atom_full_seq = {} 
+    # chain -> list of chars (filtered by IMGT 105-117 range)
+    atom_cdr3_parts = {} 
+    
+    # State trackers for parsing ATOMs efficiently
+    # chain -> last_residue_id_string (e.g. "112A") to handle deduplication
+    last_seen_res = {} 
+
     for line in lines:
-        if "PAIRED_HL" in line:
-            m = pattern.search(line)
+        # 1. Parse REMARK 5 PAIRED_HL
+        if line.startswith("REMARK   5") and "PAIRED_HL" in line:
+            m = PAIRED_HL_PATTERN.search(line)
             if m:
                 pairs.append({
                     "H": m.group(1),
                     "L": m.group(2),
                     "AG": m.group(3).split(",")
                 })
-    return pairs
+            continue
 
-# ---------------- SEQRES PARSER ----------------
-def parse_seqres_sequences(lines):
-    """
-    Return dict: chain -> full sequence string from SEQRES.
-    """
-    seqres = {}
-    for line in lines:
-        if not line.startswith("SEQRES"):
+        # 2. Parse SEQRES
+        if line.startswith("SEQRES"):
+            if len(line) < 19: continue
+            chain = line[11] # Column 12 (index 11) is chain ID
+            residues = line[19:].split()
+            if chain not in seqres_data:
+                seqres_data[chain] = []
+            for r in residues:
+                seqres_data[chain].append(AA_MAP.get(r, 'X'))
             continue
-        # chain id typically at column 11 (0-indexed)
-        if len(line) < 12:
-            continue
-        chain = line[11].strip()
-        if not chain:
-            continue
-        residues_part = line[19:].strip()
-        if not residues_part:
-            continue
-        three_letter = residues_part.split()
-        one_letter = [three_to_one(x) for x in three_letter]
-        seqres.setdefault(chain, []).extend(one_letter)
-    for ch in list(seqres.keys()):
-        seqres[ch] = "".join(seqres[ch])
-    return seqres
 
-# ---------------- ATOM PARSER (PDB/IMGT order) ----------------
-def parse_sequences_from_pdb(lines):
-    """
-    Parse ATOM records **in file order** and build seqs[chain] = [(pos_raw, aa), ...].
-    pos_raw is taken from columns 22:27 (IMGT renumbered position string, may include letters).
-    Deduplicate only exact pos_raw (keep first occurrence).
-    """
-    seqs_raw = {}
+        # 3. Parse ATOM
+        if line.startswith("ATOM"):
+            # Fixed width slicing is faster than strip() or split()
+            chain = line[21]
+            res_name = line[17:20]
+            
+            # IMGT numbering: Cols 23-26 (index 22:26) is number, Col 27 (index 26) is insertion
+            # Combined ID for deduplication (e.g., " 112 A")
+            res_id_full = line[22:27] 
 
-    for line in lines:
-        if not line.startswith("ATOM"):
-            continue
-        # safe slicing
-        res_name = line[17:20].strip()
-        chain = line[21].strip()
-        pos_raw = line[22:27].strip()  # e.g., "112", "112A", "112AA", or ""
-        if not chain:
-            continue
-        if not res_name:
-            continue
-        if res_name.upper() not in AA_MAP:
-            continue
-        aa = three_to_one(res_name)
-        seqs_raw.setdefault(chain, []).append((pos_raw, aa))
-
-    # Deduplicate exact pos_raw strings while preserving first occurrence
-    seqs = {}
-    for ch, items in seqs_raw.items():
-        seen = set()
-        out = []
-        for pos_raw, aa in items:
-            # use full pos_raw as key; empty pos_raw allowed but will be deduped too
-            key = pos_raw
-            if key in seen:
+            # Quick check: Only process if we moved to a new residue
+            if last_seen_res.get(chain) == res_id_full:
                 continue
-            seen.add(key)
-            out.append((pos_raw, aa))
-        seqs[ch] = out
+            
+            # Update state
+            last_seen_res[chain] = res_id_full
 
-    return seqs
+            # Convert AA
+            aa = AA_MAP.get(res_name, 'X') # res_name is usually upper in PDB
+            
+            # Append to full ATOM sequence
+            if chain not in atom_full_seq:
+                atom_full_seq[chain] = []
+                atom_cdr3_parts[chain] = []
+            
+            atom_full_seq[chain].append(aa)
 
-# ---------------- HELPER: numeric prefix ----------------
-def numeric_prefix(pos_raw):
-    """
-    Return the numeric prefix of an IMGT position string.
-    e.g., "112" -> 112, "112A" -> 112, "112AA" -> 112
-    Returns None if no leading digits found.
-    """
-    if not pos_raw:
-        return None
-    i = 0
-    while i < len(pos_raw) and pos_raw[i].isdigit():
-        i += 1
-    if i == 0:
-        return None
-    try:
-        return int(pos_raw[:i])
-    except:
-        return None
+            # Check CDR3 Range (105-117)
+            # Parse the integer part. PDB format guarantees this is numeric or space.
+            try:
+                res_num = int(line[22:26])
+                if CDR3_START <= res_num <= CDR3_END:
+                    atom_cdr3_parts[chain].append(aa)
+            except ValueError:
+                # Handle edge cases where res number is empty/malformed
+                pass
 
-# ---------------- CDR3 EXTRACTION ----------------
-def extract_cdr3_from_seq_list(seq_list, start=105, end=117):
-    """
-    Given seq_list = [(pos_raw, aa), ...] in IMGT-provided order,
-    return CDR3 string consisting of all aa whose numeric_prefix in [start,end].
-    Keeps order exactly as in seq_list. Includes lettered positions.
-    """
-    out = []
-    for pos_raw, aa in seq_list:
-        num = numeric_prefix(pos_raw)
-        if num is None:
-            continue
-        if start <= num <= end:
-            out.append(aa)
-    return "".join(out)
-
-# ---------------- MAIN PROCESS PDB ----------------
-def process_pdb(filepath):
-    """
-    Process a single IMGT-renumbered PDB file and return rows:
-    [{"pdb_id":..., "heavy_cdr3":..., "light_cdr3":..., "antigen_chain":..., "antigen_seq":...}, ...]
-    """
-    pdb_id = os.path.splitext(os.path.basename(filepath))[0].upper()
-    with open(filepath, "r") as f:
-        lines = f.readlines()
-
-    pairs = parse_paired_hl_lines(lines)
     if not pairs:
         return []
 
-    seqs_atom = parse_sequences_from_pdb(lines)
-    seqres = parse_seqres_sequences(lines)
-
+    # Build Rows
     rows = []
+    
+    # Join SEQRES lists into strings once
+    seqres_strings = {k: "".join(v) for k, v in seqres_data.items()}
+    atom_strings = {k: "".join(v) for k, v in atom_full_seq.items()}
+    cdr3_strings = {k: "".join(v) for k, v in atom_cdr3_parts.items()}
+
     for pair in pairs:
         H = pair["H"]
         L = pair["L"]
         AG_list = pair["AG"]
 
-        # require heavy and light present in ATOM to extract CDR3
-        if H not in seqs_atom or L not in seqs_atom:
+        # Require heavy and light CDR3s to exist
+        if H not in cdr3_strings or L not in cdr3_strings:
             continue
 
-        heavy_cdr3 = extract_cdr3_from_seq_list(seqs_atom[H])
-        light_cdr3 = extract_cdr3_from_seq_list(seqs_atom[L])
+        heavy_cdr3 = cdr3_strings[H]
+        light_cdr3 = cdr3_strings[L]
 
         for ag in AG_list:
-            # prefer SEQRES for antigen full sequence, else fallback to ATOM order
-            if ag in seqres:
-                antigen_seq = seqres[ag]
+            # Priority: SEQRES -> ATOM -> Skip
+            if ag in seqres_strings:
+                antigen_seq = seqres_strings[ag]
+            elif ag in atom_strings:
+                antigen_seq = atom_strings[ag]
             else:
-                if ag in seqs_atom:
-                    antigen_seq = "".join([aa for (pos, aa) in seqs_atom[ag]])
-                else:
-                    # antigen chain missing; skip
-                    continue
+                continue
 
             rows.append({
                 "pdb_id": pdb_id,
@@ -192,26 +159,39 @@ def process_pdb(filepath):
 
     return rows
 
-# ---------------- RUN OVER DIRECTORY ----------------
+# ---------------- RUN MANAGER ----------------
 def run_all(imgt_dir=IMGTPDB_DIR, out_csv=OUT_CSV):
-    all_rows = []
     if not os.path.isdir(imgt_dir):
-        raise RuntimeError("IMGTPDB_DIR not found: " + str(imgt_dir))
+        raise RuntimeError(f"IMGTPDB_DIR not found: {imgt_dir}")
 
-    for fname in sorted(os.listdir(imgt_dir)):
-        if not fname.lower().endswith(".pdb"):
-            continue
-        fpath = os.path.join(imgt_dir, fname)
-        try:
-            rows = process_pdb(fpath)
-            all_rows.extend(rows)
-        except Exception as e:
-            # print minimal error and continue
-            print("Error processing", fname, ":", repr(e))
+    # Gather all files
+    files = [
+        os.path.join(imgt_dir, f) 
+        for f in os.listdir(imgt_dir) 
+        if f.lower().endswith(".pdb")
+    ]
+    
+    if not files:
+        print("No PDB files found.")
+        return
+
+    all_rows = []
+    
+    # Parallel Execution
+    # Adjust max_workers based on your CPU; None defaults to number of processors
+    print(f"Processing {len(files)} files...")
+    
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        # Map returns results in order
+        results = executor.map(process_single_pdb, files)
+        
+        for res in results:
+            if res:
+                all_rows.extend(res)
 
     df = pd.DataFrame(all_rows)
     df.to_csv(out_csv, index=False)
-    print("Wrote {} rows to {}".format(len(df), out_csv))
+    print(f"Wrote {len(df)} rows to {out_csv}")
 
 # ---------------- MAIN ----------------
 if __name__ == "__main__":
