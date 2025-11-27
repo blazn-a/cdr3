@@ -1,198 +1,240 @@
 # -*- coding: ascii -*-
 import os
-import re
 import pandas as pd
 import concurrent.futures
-from functools import partial
+from collections import Counter, defaultdict
 
-# ---------------- CONFIG ----------------
-IMGTPDB_DIR = "data/imgt_pdbs"
-OUT_CSV = "cdr3_antigen_dataset.csv"
+# ---------------- CONFIGURATION ----------------
+# NOTE: Ensure these directories exist and contain the relevant PDB files
+IMGTPDB_DIR = "data/imgt_pdbs"       # Source for CDR3s and Headers
+ORIGINAL_PDB_DIR = "data/original_pdbs" # Source for Antigen SEQRES
+
+# Output CSV files will be saved in the script's current directory
+OUT_CSV = os.path.join(os.getcwd(), "cdr3_antigen_dataset.csv") 
+SIMPLIFIED_OUT_CSV = os.path.join(os.getcwd(), "antigen_cdr3_pairs.csv") 
+
 CDR3_START = 105
 CDR3_END = 117
 
-# ---------------- AA MAP ----------------
+# ---------------- AMINO ACID MAP ----------------
 AA_MAP = {
     'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C',
     'GLN': 'Q', 'GLU': 'E', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
     'LEU': 'L', 'LYS': 'K', 'MET': 'M', 'PHE': 'F', 'PRO': 'P',
     'SER': 'S', 'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V',
-    'SEC': 'U', 'PYL': 'O'
+    'SEC': 'U', 'PYL': 'O', 'MSE': 'M', 'UNK': 'X'
 }
 
-# Pre-compile Regex
-PAIRED_HL_PATTERN = re.compile(
-    r"PAIRED_HL\s+HCHAIN=([A-Za-z0-9])\s+LCHAIN=([A-Za-z0-9])\s+AGCHAIN=([\w,]+)"
-)
+# ---------------- CORE PARSING FUNCTIONS ----------------
 
-def three_to_one(res):
-    return AA_MAP.get(res, 'X')
-
-# ---------------- CORE PROCESSOR ----------------
-def process_single_pdb(filepath):
-    """
-    Parses a single PDB file in one pass.
-    Returns a list of row dictionaries.
-    """
-    pdb_id = os.path.splitext(os.path.basename(filepath))[0].upper()
+def parse_header_flexible(line):
+    """Parses PAIRED_HL or SINGLE headers and handles mixed AGCHAIN delimiters."""
+    is_single = "SINGLE" in line
     
+    clean_line = line.replace("REMARK   5", "").replace("PAIRED_HL", "").replace("SINGLE", "")
+    tokens = clean_line.split()
+    
+    data = {}
+    for token in tokens:
+        if "=" in token:
+            key, val = token.split("=", 1)
+            data[key.strip()] = val.strip()
+    
+    if "HCHAIN" in data and "AGCHAIN" in data:
+        ag_raw = data["AGCHAIN"].replace(";", ",")
+        ag_list = [x.strip().upper() for x in ag_raw.split(",") if x.strip()]
+
+        return {
+            "mode": "SINGLE" if is_single else "PAIRED",
+            "H": data["HCHAIN"].upper(),
+            "L": data.get("LCHAIN", "").upper() if "LCHAIN" in data else None,
+            "AG": ag_list
+        }
+    return None
+
+def get_pdb_id_from_filepath(filepath):
+     name = os.path.splitext(os.path.basename(filepath))[0].upper()
+     return name.replace('PDB', '')
+
+def parse_seqres_from_original_pdb(pdb_id, original_pdb_dir):
+    """Extracts all SEQRES lines from the original PDB file for full sequence retrieval."""
+    seqres_data = {}
+    
+    original_filepaths = [
+        os.path.join(original_pdb_dir, f"{pdb_id}.PDB"),
+        os.path.join(original_pdb_dir, f"PDB{pdb_id}.ENT"),
+        os.path.join(original_pdb_dir, f"{pdb_id}.ENT")
+    ]
+    
+    found_path = next((p for p in original_filepaths if os.path.exists(p)), None)
+    
+    if not found_path:
+        return seqres_data
+
     try:
-        with open(filepath, "r") as f:
-            # Read all lines once
+        with open(found_path, "r") as f:
+            for line in f:
+                if line.startswith("SEQRES"):
+                    if len(line) < 19: continue
+                    chain = line[11].upper()
+                    residues = line[19:].split()
+                    if chain not in seqres_data:
+                        seqres_data[chain] = []
+                    for r in residues:
+                        seqres_data[chain].append(AA_MAP.get(r, 'X'))
+    except Exception:
+        pass
+    
+    return {k: "".join(v) for k, v in seqres_data.items()}
+
+# ---------------- MAIN PROCESS FUNCTION ----------------
+
+def process_single_pdb(imgt_filepath):
+    pdb_id = get_pdb_id_from_filepath(imgt_filepath) 
+    
+    # --- STEP 1: Parse IMGT file for CDR3 and Headers (Pairing Info) ---
+    try:
+        with open(imgt_filepath, "r") as f:
             lines = f.readlines()
-    except Exception as e:
-        return []
+    except Exception:
+        return [], "ReadError_IMGT", pdb_id
 
-    # Data containers
-    pairs = []
-    seqres_data = {} # chain -> list of chars
+    header_info = []
+    atom_cdr3_parts = defaultdict(list)
+    last_seen_res = {}
+    found_header_line = False
     
-    # ATOM data containers
-    # chain -> list of chars
-    atom_full_seq = {} 
-    # chain -> list of chars (filtered by IMGT 105-117 range)
-    atom_cdr3_parts = {} 
-    
-    # State trackers for parsing ATOMs efficiently
-    # chain -> last_residue_id_string (e.g. "112A") to handle deduplication
-    last_seen_res = {} 
-
     for line in lines:
-        # 1. Parse REMARK 5 PAIRED_HL
-        if line.startswith("REMARK   5") and "PAIRED_HL" in line:
-            m = PAIRED_HL_PATTERN.search(line)
-            if m:
-                pairs.append({
-                    "H": m.group(1),
-                    "L": m.group(2),
-                    "AG": m.group(3).split(",")
-                })
+        if line.startswith("REMARK   5") and ("PAIRED_HL" in line or "SINGLE" in line):
+            info = parse_header_flexible(line)
+            if info:
+                header_info.append(info)
+                found_header_line = True
             continue
 
-        # 2. Parse SEQRES
-        if line.startswith("SEQRES"):
-            if len(line) < 19: continue
-            chain = line[11] # Column 12 (index 11) is chain ID
-            residues = line[19:].split()
-            if chain not in seqres_data:
-                seqres_data[chain] = []
-            for r in residues:
-                seqres_data[chain].append(AA_MAP.get(r, 'X'))
-            continue
-
-        # 3. Parse ATOM
         if line.startswith("ATOM"):
-            # Fixed width slicing is faster than strip() or split()
-            chain = line[21]
-            res_name = line[17:20]
+            chain = line[21].upper()
+            res_id_full = line[22:27]
             
-            # IMGT numbering: Cols 23-26 (index 22:26) is number, Col 27 (index 26) is insertion
-            # Combined ID for deduplication (e.g., " 112 A")
-            res_id_full = line[22:27] 
-
-            # Quick check: Only process if we moved to a new residue
             if last_seen_res.get(chain) == res_id_full:
                 continue
-            
-            # Update state
             last_seen_res[chain] = res_id_full
 
-            # Convert AA
-            aa = AA_MAP.get(res_name, 'X') # res_name is usually upper in PDB
-            
-            # Append to full ATOM sequence
-            if chain not in atom_full_seq:
-                atom_full_seq[chain] = []
-                atom_cdr3_parts[chain] = []
-            
-            atom_full_seq[chain].append(aa)
+            res_name = line[17:20].strip()
+            aa = AA_MAP.get(res_name, 'X')
 
-            # Check CDR3 Range (105-117)
-            # Parse the integer part. PDB format guarantees this is numeric or space.
             try:
                 res_num = int(line[22:26])
                 if CDR3_START <= res_num <= CDR3_END:
                     atom_cdr3_parts[chain].append(aa)
             except ValueError:
-                # Handle edge cases where res number is empty/malformed
                 pass
-
-    if not pairs:
-        return []
-
-    # Build Rows
-    rows = []
     
-    # Join SEQRES lists into strings once
-    seqres_strings = {k: "".join(v) for k, v in seqres_data.items()}
-    atom_strings = {k: "".join(v) for k, v in atom_full_seq.items()}
+    # --- STEP 2: Get full SEQRES from Original PDB ---
+    seqres_strings = parse_seqres_from_original_pdb(pdb_id, ORIGINAL_PDB_DIR)
+
+    # --- STEP 3: Build Final Rows ---
+    if not found_header_line or not header_info:
+        return [], "No_Header_Found", pdb_id
+
     cdr3_strings = {k: "".join(v) for k, v in atom_cdr3_parts.items()}
 
-    for pair in pairs:
-        H = pair["H"]
-        L = pair["L"]
-        AG_list = pair["AG"]
+    rows = []
+    success = False
+    
+    for info in header_info:
+        H, L, AG_list, mode = info["H"], info["L"], info["AG"], info["mode"]
 
-        # Require heavy and light CDR3s to exist
-        if H not in cdr3_strings or L not in cdr3_strings:
+        # CDR3 Validation (IMGT source)
+        heavy_cdr3 = "".join(cdr3_strings.get(H, []))
+        light_cdr3 = "".join(cdr3_strings.get(L, [])) if L else ""
+
+        if len(heavy_cdr3) < 3 or (mode == "PAIRED" and len(light_cdr3) < 3):
             continue
 
-        heavy_cdr3 = cdr3_strings[H]
-        light_cdr3 = cdr3_strings[L]
-
+        # Antigen Extraction (Original PDB SEQRES source)
         for ag in AG_list:
-            # Priority: SEQRES -> ATOM -> Skip
-            if ag in seqres_strings:
-                antigen_seq = seqres_strings[ag]
-            elif ag in atom_strings:
-                antigen_seq = atom_strings[ag]
-            else:
-                continue
+            antigen_seq = seqres_strings.get(ag, "")
+            
+            if not antigen_seq: 
+                continue 
 
             rows.append({
                 "pdb_id": pdb_id,
+                "type": mode,
                 "heavy_cdr3": heavy_cdr3,
                 "light_cdr3": light_cdr3,
                 "antigen_chain": ag,
-                "antigen_seq": antigen_seq
+                "antigen_seq": antigen_seq 
             })
+            success = True
 
-    return rows
+    if success:
+        return rows, "Success", pdb_id
+    else:
+        return [], "Antigen_SEQRES_Missing_or_Invalid_CDR3", pdb_id
 
-# ---------------- RUN MANAGER ----------------
-def run_all(imgt_dir=IMGTPDB_DIR, out_csv=OUT_CSV):
-    if not os.path.isdir(imgt_dir):
-        raise RuntimeError(f"IMGTPDB_DIR not found: {imgt_dir}")
+# ---------------- RUNNER ----------------
 
-    # Gather all files
-    files = [
-        os.path.join(imgt_dir, f) 
-        for f in os.listdir(imgt_dir) 
-        if f.lower().endswith(".pdb")
-    ]
-    
-    if not files:
-        print("No PDB files found.")
+def run_all(imgt_dir=IMGTPDB_DIR, original_dir=ORIGINAL_PDB_DIR, out_csv=OUT_CSV, simplified_out_csv=SIMPLIFIED_OUT_CSV):
+    if not os.path.isdir(imgt_dir) or not os.path.isdir(original_dir):
+        print(f"Error: Ensure both directories exist: {imgt_dir} and {original_dir}")
         return
 
+    files = [os.path.join(imgt_dir, f) for f in os.listdir(imgt_dir) if f.lower().endswith(".pdb")]
+    print(f"Processing {len(files)} IMGT files in parallel...")
+
     all_rows = []
-    
-    # Parallel Execution
-    # Adjust max_workers based on your CPU; None defaults to number of processors
-    print(f"Processing {len(files)} files...")
-    
+    stats = Counter()
+    error_samples = defaultdict(list)
+
     with concurrent.futures.ProcessPoolExecutor() as executor:
-        # Map returns results in order
         results = executor.map(process_single_pdb, files)
         
-        for res in results:
-            if res:
-                all_rows.extend(res)
+        for rows, status, pdb_id in results:
+            stats[status] += 1
+            error_samples[status].append(pdb_id)
+            if rows:
+                all_rows.extend(rows)
 
-    df = pd.DataFrame(all_rows)
-    df.to_csv(out_csv, index=False)
-    print(f"Wrote {len(df)} rows to {out_csv}")
+    print("\n" + "="*60)
+    print("FINAL PROCESSING REPORT")
+    print("="*60)
+    for status, count in stats.most_common():
+        print(f"[{status}]: {count}")
+        if status != "Success":
+             print(f"   Sample IDs: {', '.join(error_samples[status][:3])}")
 
-# ---------------- MAIN ----------------
+    # --- 1. WRITE FULL OUTPUT CSV ---
+    df_full = pd.DataFrame(all_rows)
+    df_full.to_csv(out_csv, index=False)
+    print("\n" + "="*60)
+    print(f"SUCCESS: Wrote {len(df_full)} rows to FULL output ({out_csv})")
+    print("="*60)
+
+    # --- 2. CREATE AND WRITE SIMPLIFIED ML OUTPUT CSV ---
+    
+    df_simplified = df_full.rename(columns={
+        'pdb_id': 'pdb', 
+        'heavy_cdr3': 'cdr3_seq'
+    })
+    
+    # All are positive binders (1)
+    df_simplified['label'] = 1
+    
+    # Reorder the columns as requested: pdb, antigen_seq, cdr3_seq, label
+    df_simplified = df_simplified[[
+        'pdb', 
+        'antigen_seq', 
+        'cdr3_seq', 
+        'label'
+    ]]
+    
+    df_simplified.to_csv(simplified_out_csv, index=False)
+    
+    print(f"SUCCESS: Wrote {len(df_simplified)} rows to SIMPLIFIED ML output ({simplified_out_csv})")
+    print("="*60)
+
+
 if __name__ == "__main__":
     run_all()
