@@ -28,10 +28,16 @@ AA_MAP = {
 # ---------------- CORE PARSING FUNCTIONS ----------------
 
 def parse_header_flexible(line):
-    """Parses PAIRED_HL or SINGLE headers and handles mixed AGCHAIN delimiters."""
+    """
+    Parses headers to detect:
+    1. PAIRED (H + L)
+    2. SINGLE (H only)
+    3. SINGLE (L only)
+    """
     is_single = "SINGLE" in line
     
-    clean_line = line.replace("REMARK   5", "").replace("PAIRED_HL", "").replace("SINGLE", "")
+    # Clean noise
+    clean_line = line.replace("REMARK", "").replace("5", "").replace("PAIRED_HL", "").replace("SINGLE", "")
     tokens = clean_line.split()
     
     data = {}
@@ -40,16 +46,30 @@ def parse_header_flexible(line):
             key, val = token.split("=", 1)
             data[key.strip()] = val.strip()
     
-    if "HCHAIN" in data and "AGCHAIN" in data:
-        ag_raw = data["AGCHAIN"].replace(";", ",")
-        ag_list = [x.strip().upper() for x in ag_raw.split(",") if x.strip()]
+    # Must have an Antigen Chain to be useful
+    if "AGCHAIN" not in data:
+        return None
 
-        return {
-            "mode": "SINGLE" if is_single else "PAIRED",
-            "H": data["HCHAIN"].upper(),
-            "L": data.get("LCHAIN", "").upper() if "LCHAIN" in data else None,
-            "AG": ag_list
-        }
+    # Handle mixed delimiters in Antigen Chains
+    ag_raw = data["AGCHAIN"].replace(";", ",")
+    ag_list = [x.strip().upper() for x in ag_raw.split(",") if x.strip()]
+
+    h_chain = data.get("HCHAIN", "").upper() if "HCHAIN" in data else None
+    l_chain = data.get("LCHAIN", "").upper() if "LCHAIN" in data else None
+
+    # --- DETERMINE MODE ---
+    if is_single:
+        if h_chain:
+            return {"mode": "SINGLE_H", "H": h_chain, "L": None, "AG": ag_list}
+        elif l_chain:
+            return {"mode": "SINGLE_L", "H": None, "L": l_chain, "AG": ag_list}
+        else:
+            return None # SINGLE tag but no chain ID found
+    else:
+        # PAIRED requires both H and L
+        if h_chain and l_chain:
+            return {"mode": "PAIRED", "H": h_chain, "L": l_chain, "AG": ag_list}
+        
     return None
 
 def get_pdb_id_from_filepath(filepath):
@@ -57,7 +77,7 @@ def get_pdb_id_from_filepath(filepath):
      return name.replace('PDB', '')
 
 def parse_seqres_from_original_pdb(pdb_id, original_pdb_dir):
-    """Extracts all SEQRES lines from the original PDB file for full sequence retrieval."""
+    """Extracts all SEQRES lines from the original PDB file."""
     seqres_data = {}
     
     original_filepaths = [
@@ -92,7 +112,7 @@ def parse_seqres_from_original_pdb(pdb_id, original_pdb_dir):
 def process_single_pdb(imgt_filepath):
     pdb_id = get_pdb_id_from_filepath(imgt_filepath) 
     
-    # --- STEP 1: Parse IMGT file for CDR3 and Headers (Pairing Info) ---
+    # --- STEP 1: Parse IMGT file for CDR3 and Headers ---
     try:
         with open(imgt_filepath, "r") as f:
             lines = f.readlines()
@@ -105,7 +125,7 @@ def process_single_pdb(imgt_filepath):
     found_header_line = False
     
     for line in lines:
-        if line.startswith("REMARK   5") and ("PAIRED_HL" in line or "SINGLE" in line):
+        if line.startswith("REMARK") and ("PAIRED_HL" in line or "SINGLE" in line):
             info = parse_header_flexible(line)
             if info:
                 header_info.append(info)
@@ -145,14 +165,30 @@ def process_single_pdb(imgt_filepath):
     for info in header_info:
         H, L, AG_list, mode = info["H"], info["L"], info["AG"], info["mode"]
 
-        # CDR3 Validation (IMGT source)
-        heavy_cdr3 = "".join(cdr3_strings.get(H, []))
+        # Retrieve sequences (safely handle None for H or L)
+        heavy_cdr3 = "".join(cdr3_strings.get(H, [])) if H else ""
         light_cdr3 = "".join(cdr3_strings.get(L, [])) if L else ""
 
-        if len(heavy_cdr3) < 3 or (mode == "PAIRED" and len(light_cdr3) < 3):
+        # --- VALIDATION LOGIC ---
+        valid_entry = False
+
+        if mode == "PAIRED":
+            # Needs both valid
+            if len(heavy_cdr3) >= 3 and len(light_cdr3) >= 3:
+                valid_entry = True
+        elif mode == "SINGLE_H":
+            # Needs valid Heavy
+            if len(heavy_cdr3) >= 3:
+                valid_entry = True
+        elif mode == "SINGLE_L":
+            # Needs valid Light
+            if len(light_cdr3) >= 3:
+                valid_entry = True
+
+        if not valid_entry:
             continue
 
-        # Antigen Extraction (Original PDB SEQRES source)
+        # --- ANTIGEN EXTRACTION ---
         for ag in AG_list:
             antigen_seq = seqres_strings.get(ag, "")
             
@@ -210,31 +246,32 @@ def run_all(imgt_dir=IMGTPDB_DIR, original_dir=ORIGINAL_PDB_DIR, out_csv=OUT_CSV
     df_full.to_csv(out_csv, index=False)
     print("\n" + "="*60)
     print(f"SUCCESS: Wrote {len(df_full)} rows to FULL output ({out_csv})")
-    print("="*60)
 
     # --- 2. CREATE AND WRITE SIMPLIFIED ML OUTPUT CSV ---
+    if not df_full.empty:
+        # Create a copy for ML input
+        df_ml = df_full.copy()
+        
+        # KEY LOGIC: "cdr3_seq" will be Heavy if present, otherwise Light (for SINGLE_L)
+        # 1. Initialize with Heavy
+        df_ml['cdr3_seq'] = df_ml['heavy_cdr3']
+        
+        # 2. Fill missing/empty Heavy spots with Light (specifically for SINGLE_L cases)
+        # Note: In SINGLE_H or PAIRED, heavy_cdr3 is populated. In SINGLE_L, heavy_cdr3 is "".
+        df_ml.loc[df_ml['type'] == 'SINGLE_L', 'cdr3_seq'] = df_ml.loc[df_ml['type'] == 'SINGLE_L', 'light_cdr3']
+        
+        df_ml = df_ml.rename(columns={'pdb_id': 'pdb'})
+        df_ml['label'] = 1
+        
+        # Select final columns
+        df_simplified = df_ml[['pdb', 'antigen_seq', 'cdr3_seq', 'label']]
+        
+        df_simplified.to_csv(simplified_out_csv, index=False)
+        print(f"SUCCESS: Wrote {len(df_simplified)} rows to SIMPLIFIED ML output ({simplified_out_csv})")
+    else:
+        print("WARNING: No rows generated, skipping simplified CSV.")
     
-    df_simplified = df_full.rename(columns={
-        'pdb_id': 'pdb', 
-        'heavy_cdr3': 'cdr3_seq'
-    })
-    
-    # All are positive binders (1)
-    df_simplified['label'] = 1
-    
-    # Reorder the columns as requested: pdb, antigen_seq, cdr3_seq, label
-    df_simplified = df_simplified[[
-        'pdb', 
-        'antigen_seq', 
-        'cdr3_seq', 
-        'label'
-    ]]
-    
-    df_simplified.to_csv(simplified_out_csv, index=False)
-    
-    print(f"SUCCESS: Wrote {len(df_simplified)} rows to SIMPLIFIED ML output ({simplified_out_csv})")
     print("="*60)
-
 
 if __name__ == "__main__":
     run_all()
