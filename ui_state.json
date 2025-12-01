@@ -1,7 +1,7 @@
 {
   "antigen": "",
   "seed_cdr3": "CARDRSTGYVYFDYW",
-  "esm": "t6_8M",
+  "esm": "t12_35M",
   "checkpoint": "score_model.pt",
   "steps": 200,
   "beam": 50,
@@ -10,6 +10,14 @@
   "embed_batch": 64,
   "clusters": 12,
   "out_folder": "runs",
+  "pairs_csv": "data/antigen_cdr3_pairs.csv",
+  "epochs": 30,
+  "train_batch": 128,
+  "threads": 2,
+  "use_gpu": false,
+  "hard_neg": true,
+  "hn_factor": 1,
+  "pos_mult": 1,
   "last_raw": "",
   "last_filtered": "",
   "last_panel": ""

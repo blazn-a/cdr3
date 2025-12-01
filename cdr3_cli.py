@@ -221,6 +221,7 @@ def action_optimize(S):
                "--beam", S["beam"],
                "--topk", 20,
                "--k_mut", S["k_mut"],
+               "--esm", S["esm"],
                "--ckpt", S["checkpoint"],
                "--out_csv", out_csv)
         print(Fore.GREEN + f"Wrote {out_csv}" + Style.RESET_ALL)
